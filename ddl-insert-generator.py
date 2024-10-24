@@ -1,4 +1,5 @@
 import re
+from typing import List, Tuple, Set
 
 def extract_table_name(ddl_statement):
     """Extract table name from DDL statement"""
@@ -81,6 +82,17 @@ def extract_columns_from_ddl(ddl_statement):
     except AttributeError:
         return []
 
+def find_column_mismatches(source_columns: List[Tuple[str, str]], 
+                         target_columns: List[Tuple[str, str]]) -> Tuple[Set[str], Set[str]]:
+    """Find columns that exist in source but not in target and vice versa"""
+    source_normalized = {col[1] for col in source_columns}
+    target_normalized = {col[1] for col in target_columns}
+    
+    source_only = source_normalized - target_normalized
+    target_only = target_normalized - source_normalized
+    
+    return source_only, target_only
+
 def generate_insert_statement(source_ddl, target_ddl):
     """Generate Redshift INSERT INTO statement based on source and target DDLs"""
     source_table = extract_table_name(source_ddl)
@@ -95,20 +107,36 @@ def generate_insert_statement(source_ddl, target_ddl):
     if not source_columns or not target_columns:
         return "Error: Could not extract columns"
     
-    # Create the INSERT INTO statement
-    target_cols = [col[0] for col in target_columns]
+    # Find column mismatches
+    source_only, target_only = find_column_mismatches(source_columns, target_columns)
+    
+    # Generate comments about mismatches
+    comments = []
+    if source_only:
+        comments.append(f"-- WARNING: Following columns exist in source but not in target: {', '.join(sorted(source_only))}")
+    if target_only:
+        comments.append(f"-- WARNING: Following columns exist in target but not in source: {', '.join(sorted(target_only))}")
+    
+    # Filter out columns that don't exist in target
     source_cols = []
+    target_cols = []
     
-    # Generate SELECT expressions with AS clauses for columns with spaces
-    for col in source_columns:
-        original_name = col[0]
-        normalized_name = col[1]
-        if ' ' in original_name.strip('"'):
-            source_cols.append(f'{original_name} as {normalized_name}')
-        else:
-            source_cols.append(original_name)
+    # Map of normalized names to help with matching
+    target_normalized_map = {col[1]: col[0] for col in target_columns}
     
-    insert_stmt = f"INSERT INTO {target_table} (\n    "
+    # Generate SELECT and INSERT columns, only including matching columns
+    for source_col in source_columns:
+        source_original, source_normalized = source_col
+        if source_normalized in target_normalized_map:
+            target_cols.append(target_normalized_map[source_normalized])
+            if ' ' in source_original.strip('"'):
+                source_cols.append(f'{source_original} as {source_normalized}')
+            else:
+                source_cols.append(source_original)
+    
+    # Create the INSERT INTO statement with comments
+    insert_stmt = "\n".join(comments) + "\n" if comments else ""
+    insert_stmt += f"INSERT INTO {target_table} (\n    "
     insert_stmt += ",\n    ".join(target_cols)
     insert_stmt += "\n)\nSELECT\n    "
     insert_stmt += ",\n    ".join(source_cols)
@@ -118,7 +146,7 @@ def generate_insert_statement(source_ddl, target_ddl):
 
 # Example usage
 if __name__ == "__main__":
-    # Test DDLs
+    # Test DDLs with mismatched columns
     source_ddl = """
     CREATE TABLE source_employees (
         id INTEGER PRIMARY KEY,
@@ -126,7 +154,7 @@ if __name__ == "__main__":
         'last name' VARCHAR(50),
         "email address" TEXT NOT NULL,
         created_at TIMESTAMP,
-        "phone number" VARCHAR(20)
+        "source only column" VARCHAR(20)
     )
     """
     
@@ -136,8 +164,8 @@ if __name__ == "__main__":
         "first name" VARCHAR(50),
         "last name" VARCHAR(50),
         "email address" TEXT NOT NULL,
-        created_at TIMESTAMP,
-        "phone number" VARCHAR(20)
+        modified_at TIMESTAMP,
+        "target only column" VARCHAR(20)
     )
     """
     
