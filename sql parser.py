@@ -1,3 +1,20 @@
+# pip install sqlparse
+# python
+# Copy code
+# import sqlparse
+# from sqlparse.sql import IdentifierList, Identifier, Where, Comparison
+# from sqlparse.tokens import Keyword, DML, Whitespace, Name
+
+# from pyspark.sql import SparkSession
+# from pyspark.sql.functions import udf, col
+# from pyspark.sql.types import StructType, StructField, StringType
+
+
+
+
+
+
+
 spark = SparkSession.builder.getOrCreate()
 
 # Sample input DataFrame with a column named "query"
