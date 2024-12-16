@@ -1,15 +1,10 @@
-# pip install sqlparse
-# python
-# Copy code
-# import sqlparse
-# from sqlparse.sql import IdentifierList, Identifier, Where, Comparison
-# from sqlparse.tokens import Keyword, DML, Whitespace, Name
+import sqlparse
+from sqlparse.sql import IdentifierList, Identifier, Where, Comparison
+from sqlparse.tokens import Keyword, DML, Whitespace
 
-# from pyspark.sql import SparkSession
-# from pyspark.sql.functions import udf, col
-# from pyspark.sql.types import StructType, StructField, StringType
-
-
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col
+from pyspark.sql.types import StructType, StructField, StringType
 
 
 
@@ -20,15 +15,52 @@ spark = SparkSession.builder.getOrCreate()
 # Sample input DataFrame with a column named "query"
 data = [
     ("SELECT a.col1, b.col2 FROM tableA a JOIN tableB b ON a.id = b.id WHERE a.col3 = 'xyz'",),
-    ("SELECT x, y FROM tableC WHERE z = 100",),
-    ("SELECT * FROM tableD d JOIN tableE e ON d.key = e.key AND d.category = e.category",),
+    ("SELECT x, y FROM schema1.tableC WHERE z = 100",),
+    ("SELECT * FROM db.tableD d JOIN tableE e ON d.key = e.key AND d.category = e.category",),
+    ("SELECT * FROM tableF f JOIN (SELECT * FROM tableG) g ON f.g_id = g.g_id",),
 ]
 df = spark.createDataFrame(data, ["query"])
+
+def extract_tables(token):
+    """
+    Extract real table names (without alias) from a token that could be:
+      - An Identifier (e.g. "tableA a")
+      - An IdentifierList (e.g. "tableA a, tableB b")
+    Returns a list of strings (the actual table names).
+    """
+    extracted = []
+    if isinstance(token, Identifier):
+        real_name = token.get_real_name()  # e.g. "tableA"
+        if real_name:
+            extracted.append(real_name)
+        else:
+            # Fallback: If get_real_name() is None, maybe no alias or weird syntax
+            extracted.append(token.value)
+    elif isinstance(token, IdentifierList):
+        for sub_id in token.get_identifiers():
+            real_name = sub_id.get_real_name()
+            if real_name:
+                extracted.append(real_name)
+            else:
+                extracted.append(sub_id.value)
+    return extracted
+
+def extract_columns_from_comparison(comp_token):
+    """
+    Extract column references from a sqlparse.sql.Comparison token (e.g. 'a.id = b.id').
+    Returns a list of strings (left-side and right-side).
+    """
+    comp_cols = []
+    if isinstance(comp_token, Comparison):
+        left = comp_token.left.value.strip()
+        right = comp_token.right.value.strip()
+        comp_cols.extend([left, right])
+    return comp_cols
 
 def parse_sql_with_sqlparse(query_str: str):
     """
     Parses a single SQL statement using sqlparse to extract:
-      - tables in FROM or JOIN
+      - tables in FROM or JOIN (only real table names, no aliases)
       - original query
       - columns used in join (ON clauses)
       - columns in WHERE clause
@@ -38,137 +70,79 @@ def parse_sql_with_sqlparse(query_str: str):
     """
     if not query_str:
         return ("", "", "", "")
-    
-    # Parse the query string
-    parsed_statements = sqlparse.parse(query_str)
-    if not parsed_statements:
+
+    parsed = sqlparse.parse(query_str)
+    if not parsed:
         return ("", query_str, "", "")
 
-    stmt = parsed_statements[0]  # Assume single statement
-    
-    tables = []
+    stmt = parsed[0]  # Assume a single statement for simplicity
+
+    tables = set()
     join_columns = []
     where_columns = []
 
-    # We’ll traverse the top-level tokens to find:
-    # - FROM and JOIN clauses to get table references
-    # - WHERE clause to parse out columns
-    # - ON clauses for join columns
+    where_clause = None  # Will store a reference to the WHERE block if found
 
-    # sqlparse organizes tokens hierarchically. For each token:
-    #   - Check if it's a "FROM" or "JOIN" token (or part of a segment that has them).
-    #   - For the WHERE clause, find the Where token block.
-
-    # Helper function: Extract table names from a token (which might be an Identifier or IdentifierList)
-    def extract_tables(token):
-        extracted = []
-        if isinstance(token, Identifier):
-            # token.get_real_name() can sometimes return the alias or actual name
-            # token.get_name() is the alias if present
-            # token.get_parent_name() might be the schema name
-            # We'll store the raw string for simplicity:
-            extracted.append(token.value)
-        elif isinstance(token, IdentifierList):
-            for t in token.get_identifiers():
-                extracted.append(t.value)
-        return extracted
-
-    # Helper function: Extract columns from ON or WHERE comparisons
-    # e.g. a.id = b.id  => we might add 'a.id' and 'b.id' to the list
-    def extract_columns_from_comparison(comparison_token):
-        comp_cols = []
-        if isinstance(comparison_token, Comparison):
-            # The left and right parts of the comparison, e.g. a.id = b.id
-            left = comparison_token.left
-            right = comparison_token.right
-            # left.value might be "a.id"
-            # right.value might be "b.id"
-            comp_cols.append(left.value.strip())
-            comp_cols.append(right.value.strip())
-        return comp_cols
-
-    where_clause = None  # Will store a reference to the WHERE block if present
-
-    # Iterate top-level tokens in the statement
+    # Walk the statement tokens
     for token in stmt.tokens:
-        # Skip whitespace, punctuation
+        # Skip whitespace
         if token.is_whitespace or token.ttype is Whitespace:
             continue
 
-        # 1. Identify FROM or JOIN sections, parse out table references
-        if token.ttype is Keyword and token.value.upper() in ("FROM", "JOIN"):
-            # The next token(s) should contain table references
-            # Usually the next significant token is an Identifier/IdentifierList
-            pass  # We'll handle this logic in the "FROM" / "JOIN" blocks below
-
+        # If token is a group (e.g. Parenthesis, Where, IdentifierList)
         if token.is_group:
-            # If it's a group (like IdentifierList or Where block), we might want to dive deeper
-            # For example, a FROM clause might be in a group, or a Where clause is a Where object
+            # Check if it's a WHERE block
             if isinstance(token, Where):
-                where_clause = token  # store for later parsing
+                where_clause = token
             else:
-                # Dive deeper into sub-tokens to find FROM/JOIN references
-                for sub in token.tokens:
-                    if sub.match(Keyword, ["FROM", "JOIN"]):
-                        # Next token (or tokens) might be the table references
-                        # We can attempt to parse the sibling tokens after FROM/JOIN
-                        idx = token.tokens.index(sub)
-                        # The next token(s) might be the tables or an IdentifierList
+                # Dive deeper
+                for subtoken in token.tokens:
+                    # If subtoken is FROM or JOIN keyword
+                    if subtoken.match(Keyword, ["FROM", "JOIN"]):
+                        # Next token(s) might contain the tables
+                        idx = token.tokens.index(subtoken)
                         if idx + 1 < len(token.tokens):
-                            next_token = token.tokens[idx + 1]
-                            tables.extend(extract_tables(next_token))
+                            table_token = token.tokens[idx + 1]
+                            tables.update(extract_tables(table_token))
 
-                    # If there's an ON block for a JOIN, we can parse columns
-                    if sub.match(Keyword, ["ON"]):
-                        # The next token might be a parenthesis block or a direct comparison
-                        on_idx = token.tokens.index(sub)
+                    # If subtoken is "ON" => parse join condition
+                    if subtoken.match(Keyword, ["ON"]):
+                        on_idx = token.tokens.index(subtoken)
                         if on_idx + 1 < len(token.tokens):
-                            on_condition_token = token.tokens[on_idx + 1]
-                            # The ON condition might be a parenthesis group or a direct comparison
-                            # We might need to check if `on_condition_token` is grouped
-                            # For simplicity, we can walk the sub-tokens of the ON condition
-                            if on_condition_token.is_group:
-                                for oc_sub in on_condition_token.tokens:
+                            on_condition = token.tokens[on_idx + 1]
+                            # The ON condition might be grouped or direct
+                            if on_condition.is_group:
+                                for oc_sub in on_condition.tokens:
                                     if isinstance(oc_sub, Comparison):
                                         join_columns.extend(extract_columns_from_comparison(oc_sub))
-                            else:
-                                # If it's not a group, it might be a single comparison
-                                # We can attempt to parse if it’s a Comparison object
-                                if isinstance(on_condition_token, Comparison):
-                                    join_columns.extend(extract_columns_from_comparison(on_condition_token))
-    
-    # If we haven't found any FROM or JOIN references in the group logic above, we can do a fallback:
-    # Some queries might present FROM table directly at the top level.
-    # We'll do a second pass to extract them, scanning top-level tokens directly.
-    # (This is a naive approach; more robust logic would unify the approach).
-    if not tables:
-        for i, token in enumerate(stmt.tokens):
-            if token.match(Keyword, ["FROM", "JOIN"]):
-                if i+1 < len(stmt.tokens):
-                    next_token = stmt.tokens[i+1]
-                    tables.extend(extract_tables(next_token))
+                            elif isinstance(on_condition, Comparison):
+                                join_columns.extend(extract_columns_from_comparison(on_condition))
 
-    # 2. Parse the WHERE clause to find columns
+        # Sometimes FROM or JOIN occur at top level
+        if token.match(Keyword, ["FROM", "JOIN"]):
+            # Next token might hold table references
+            idx = list(stmt.tokens).index(token)
+            if idx + 1 < len(stmt.tokens):
+                next_token = stmt.tokens[idx + 1]
+                tables.update(extract_tables(next_token))
+
+    # If we found a WHERE clause
     if where_clause:
-        # The Where object has sub-tokens which may include comparisons
-        for token in where_clause.tokens:
-            if isinstance(token, Comparison):
-                # Extract columns from the comparison
-                where_columns.extend(extract_columns_from_comparison(token))
-            elif token.is_group:
-                # Possibly a parenthesis or nested condition
-                for subtoken in token.tokens:
+        for wtoken in where_clause.tokens:
+            if isinstance(wtoken, Comparison):
+                where_columns.extend(extract_columns_from_comparison(wtoken))
+            elif wtoken.is_group:
+                for subtoken in wtoken.tokens:
                     if isinstance(subtoken, Comparison):
                         where_columns.extend(extract_columns_from_comparison(subtoken))
 
     # Build comma-separated strings
-    tables_str       = ",".join(tables)
-    join_cols_str    = ",".join(join_columns)
-    where_cols_str   = ",".join(where_columns)
+    tables_str     = ",".join(tables)            # unique table names only
+    join_cols_str  = ",".join(join_columns)
+    where_cols_str = ",".join(where_columns)
 
     return (tables_str, query_str, join_cols_str, where_cols_str)
 
-# Register UDF
 parse_sql_udf = udf(
     parse_sql_with_sqlparse,
     StructType([
